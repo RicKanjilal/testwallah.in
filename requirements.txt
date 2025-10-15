@@ -1,0 +1,11 @@
+flask
+flask-cors
+openai
+matplotlib
+pandas
+numpy
+pillow
+pypdf2
+python-docx
+werkzeug
+gunicorn
