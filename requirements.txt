@@ -1,6 +1,6 @@
 flask
 flask-cors
-openai
+openai>=1.40.0
 matplotlib
 pandas
 numpy
