@@ -111,21 +111,14 @@ import os
 
 def _get_key():
     """
-    Securely load OpenAI credentials from local text files.
-    These files should NOT be committed to GitHub.
+    Securely load OpenAI credentials from environment variables.
+    This avoids storing any secrets in files or GitHub.
     """
-    key_file = "openai_key.txt"
-    proj_file = "openai_project.txt"
+    api_key = os.getenv("OPENAI_API_KEY")
+    project_id = os.getenv("OPENAI_PROJECT_ID")
 
-    # read key
-    if not os.path.exists(key_file):
-        raise RuntimeError(f"Missing {key_file}")
-    api_key = open(key_file, "r", encoding="utf-8").read().strip()
-
-    # read project
-    if not os.path.exists(proj_file):
-        raise RuntimeError(f"Missing {proj_file}")
-    project_id = open(proj_file, "r", encoding="utf-8").read().strip()
+    if not api_key or not project_id:
+        raise RuntimeError("Missing OPENAI_API_KEY or OPENAI_PROJECT_ID in environment variables.")
 
     if not api_key.startswith("sk-"):
         raise RuntimeError("Invalid API key format.")
@@ -143,6 +136,7 @@ client = OpenAI(
     api_key=_creds["api_key"],
     project=_creds["project"]
 )
+
 
 
 
