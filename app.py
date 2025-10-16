@@ -109,13 +109,32 @@ def save_attempt_to_db(user_id, subject, result, run_dir, files):
 from openai import OpenAI
 import os
 
-from openai import OpenAI
-
 def _get_key():
-    # 🚨 Hardcoded OpenAI credentials (for private deploys only)
+    """
+    Securely load OpenAI credentials from local text files.
+    These files should NOT be committed to GitHub.
+    """
+    key_file = "openai_key.txt"
+    proj_file = "openai_project.txt"
+
+    # read key
+    if not os.path.exists(key_file):
+        raise RuntimeError(f"Missing {key_file}")
+    api_key = open(key_file, "r", encoding="utf-8").read().strip()
+
+    # read project
+    if not os.path.exists(proj_file):
+        raise RuntimeError(f"Missing {proj_file}")
+    project_id = open(proj_file, "r", encoding="utf-8").read().strip()
+
+    if not api_key.startswith("sk-"):
+        raise RuntimeError("Invalid API key format.")
+    if not project_id.startswith("proj_"):
+        raise RuntimeError("Invalid project ID format.")
+
     return {
-        "api_key": "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",
-        "project": "proj_AbtA9TzevkC7kcF1RHoasD2w"
+        "api_key": api_key,
+        "project": project_id
     }
 
 _creds = _get_key()
@@ -124,6 +143,7 @@ client = OpenAI(
     api_key=_creds["api_key"],
     project=_creds["project"]
 )
+
 
 
 
