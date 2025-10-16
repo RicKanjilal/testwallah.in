@@ -1,24 +1,32 @@
-import uuid, time
+import uuid, time, math, random
 import os, io, json, csv, base64, datetime as dt
-from typing import Dict, List
+from typing import Dict, List, Callable, Any
 import numpy as np
 import pandas as pd
+
 # ===== Headless plotting (fix Tkinter/thread errors) =====
 import matplotlib
+matplotlib.use("Agg")  # before pyplot import
 import matplotlib.pyplot as plt
+
 from flask import Flask, request, jsonify, send_from_directory, render_template
 from flask_cors import CORS
+
 from openai import OpenAI
 from PIL import Image, ImageEnhance
+
 # NEW imports
 import sqlite3
 from contextlib import closing
 from flask import session, redirect, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# After: app = Flask(__name__, template_folder="templates")
+# Retries
+import httpx
 
-matplotlib.use("Agg")#better manners according to pycharm
+from PyPDF2 import PdfReader
+from docx import Document
+
 # =========================
 # CONFIG & THEME SETTINGS
 # =========================
@@ -39,6 +47,7 @@ plt.rcParams.update({
     "text.color":"#e6e6e6","grid.color":"#2a2f3a",
     "axes.titleweight":"bold","axes.titlesize":14,"font.size":11
 })
+
 DB_PATH = "app.db"
 
 def db():
@@ -74,6 +83,7 @@ def init_db():
         );
         """)
 init_db()
+
 def current_user_id():
     return session.get("uid")
 
@@ -87,6 +97,7 @@ def _new_run_dir() -> str:
     run_dir = os.path.join(OUT_DIR, run_id)
     os.makedirs(run_dir, exist_ok=True)
     return run_dir
+
 def save_attempt_to_db(user_id, subject, result, run_dir, files):
     with closing(db()) as conn, conn:
         cur = conn.execute("""
@@ -102,17 +113,13 @@ def save_attempt_to_db(user_id, subject, result, run_dir, files):
         return cur.lastrowid
 
 
-
 # =========================
-# OPENAI CLIENT
+# OPENAI CLIENT (timeouts + env + retries)
 # =========================
-from openai import OpenAI
-import os
-
 def _get_key():
     """
     Securely load OpenAI credentials from environment variables.
-    This avoids storing any secrets in files or GitHub.
+    Avoids committing secrets to GitHub.
     """
     api_key = os.getenv("OPENAI_API_KEY")
     project_id = os.getenv("OPENAI_PROJECT_ID")
@@ -125,71 +132,106 @@ def _get_key():
     if not project_id.startswith("proj_"):
         raise RuntimeError("Invalid project ID format.")
 
-    return {
-        "api_key": api_key,
-        "project": project_id
-    }
+    return {"api_key": api_key, "project": project_id}
 
 _creds = _get_key()
 
+# 180s per OpenAI HTTP call
 client = OpenAI(
     api_key=_creds["api_key"],
-    project=_creds["project"]
+    project=_creds["project"],
+    timeout=180.0
 )
 
-
-
+def _retry(fn: Callable[[], Any], *, attempts: int = 4, base_delay: float = 1.0, max_delay: float = 6.0):
+    """
+    Simple exponential backoff for transient errors/timeouts/rate limits.
+    """
+    last_err = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            transient = isinstance(e, httpx.HTTPError) or ("timeout" in msg) or ("rate" in msg) or ("temporarily" in msg)
+            if transient and i < attempts - 1:
+                sleep = min(max_delay, base_delay * (2 ** i)) * (0.75 + random.random() * 0.5)
+                time.sleep(sleep)
+                continue
+            break
+    raise last_err
 
 
 # =========================
-# IMAGE OCR HELPERS (GPT-4o)
+# IMAGE OCR HELPERS (GPT-4o) — with resize + retries
 # =========================
 def preprocess_image_bytes(in_bytes: bytes, width: int = 1200) -> bytes:
-    """Grayscale, contrast boost, resize → PNG bytes (helps OCR)."""
-    img = Image.open(io.BytesIO(in_bytes)).convert("L")
-    img = ImageEnhance.Contrast(img).enhance(2.0)
-    img = img.resize((width, int(img.height * width / img.width)))
+    """
+    Light preprocessing to help OCR and reduce payload/latency:
+      - Downscale to max width
+      - Convert to grayscale
+      - Slight contrast boost
+      - Return PNG bytes
+    """
+    img = Image.open(io.BytesIO(in_bytes))
+    if img.width > width:
+        scale = width / float(img.width)
+        img = img.resize((width, int(img.height * scale)))
+    img = img.convert("L")
+    img = ImageEnhance.Contrast(img).enhance(1.8)
+
     out = io.BytesIO()
     img.save(out, format="PNG")
     return out.getvalue()
-# ---------- Multimodal helpers ----------
+
 def to_data_url(img_bytes: bytes, mime: str = "image/png") -> str:
-    """Encode raw bytes to a base64 data URL for OpenAI image content."""
     b64 = base64.b64encode(img_bytes).decode()
     return f"data:{mime};base64,{b64}"
 
+def _coerce_json(text: str) -> Dict:
+    """
+    Strip code fences, then parse JSON. Raise if it fails so the retry wrapper can kick in.
+    """
+    t = text.strip()
+    if t.startswith("```"):
+        parts = t.split("```")
+        for part in parts:
+            if "{" in part and "}" in part:
+                t = part[part.find("{") : part.rfind("}") + 1]
+                break
+    return json.loads(t)
 
 def ocr_gpt4o_from_bytes(image_png_bytes: bytes) -> str:
-    """OCR via GPT-4o vision using a base64 data URL."""
-    b64 = base64.b64encode(image_png_bytes).decode()
-    data_url = f"data:image/png;base64,{b64}"
+    """
+    OCR via GPT-4o vision using a base64 data URL.
+    Wrapped in retries. Reduced max_tokens for faster response.
+    """
+    data_url = to_data_url(image_png_bytes, mime="image/png")
     prompt = "Extract ALL readable text as plain text only. Keep natural reading order."
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": data_url}}
-            ]
-        }],
-        temperature=0.0,
-        max_tokens=3500
-    )
-    return resp.choices[0].message.content.strip()
+
+    def _call():
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                ]
+            }],
+            temperature=0.0,
+            max_tokens=1200,  # tighter for latency
+        )
+        return resp.choices[0].message.content.strip()
+
+    return _retry(_call)
+
 
 # =========================
-# GRADING (STRICT JSON)
+# GRADING (STRICT JSON) — with retries + safer JSON
 # =========================
 def grade_with_skills(qp_text: str, ans_text: str) -> Dict:
-    """
-    Ask GPT-4o to:
-      - map answers to questions
-      - grade each question
-      - return per-item skills, answer_excerpt, reason
-      - provide expected cohort averages & handwriting rank
-    Return ONLY JSON; we validate/normalize totals.
-    """
     system = (
         "You are a strict school examiner and analyst. "
         "Return ONLY valid JSON with the exact keys requested. "
@@ -217,42 +259,31 @@ Return ONLY JSON with keys EXACTLY:
       "answer_excerpt":"<=35 words quoting or tightly paraphrasing the student's answer to THIS question",
       "max": int,
       "awarded": float,
-      "skills": ["skill1","skill2?"],     // ≤3, strictly from content
+      "skills": ["skill1","skill2?"],
       "reason":"<=15 words, concise feedback citing evidence"
     }}
   ],
-  "total": int,                          // sum of max
-  "score": float,                        // sum of awarded
-  "percentage": float,                   // (score/total)*100
-  "handwriting_rank": int,               // 1-10
-  "expected_avg_percent": float,         // estimated cohort average for THIS paper
-  "expected_avg_handwriting": float,     // typical cohort handwriting rank (1-10)
-  "tips_next_time": ["tip1","tip2","tip3","tip4"]  // 3–6 practical, paper-specific tips
+  "total": int,
+  "score": float,
+  "percentage": float,
+  "handwriting_rank": int,
+  "expected_avg_percent": float,
+  "expected_avg_handwriting": float,
+  "tips_next_time": ["tip1","tip2","tip3","tip4"]
 }}
-
-Rules:
-- If marks per question aren't printed, allocate sensible max marks consistent with the paper style.
-- Award fairly; at most one decimal place.
-- Skills MUST be evidenced by the question or student's method; e.g., use 'Graph interpretation' ONLY if a graph is referenced.
-- Tips must be derived from the actual mistakes and patterns in these answers—no generic advice.
 """
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role":"system","content":system},
-                  {"role":"user","content":user}],
-        temperature=0.2,
-        max_tokens=2000
-    )
-    text = resp.choices[0].message.content.strip()
-    if text.startswith("```"):
-        parts = text.split("```")
-        if len(parts) >= 2:
-            text = parts[1]
-            if text.strip().lower().startswith("json"):
-                i = text.find("{")
-                if i != -1:
-                    text = text[i:]
-    data = json.loads(text)
+
+    def _call():
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role":"system","content":system},
+                      {"role":"user","content":user}],
+            temperature=0.2,
+            max_tokens=1400,  # tighter to avoid timeouts
+        )
+        return _coerce_json(resp.choices[0].message.content)
+
+    data = _retry(_call)
 
     # Normalize totals
     total = int(round(sum(float(i.get("max",0) or 0) for i in data.get("items", []))))
@@ -269,16 +300,14 @@ Rules:
         it["answer_excerpt"] = (it.get("answer_excerpt") or "")[:240]
         it["reason"] = (it.get("reason") or "")[:120]
     return data
+
+
 def grade_with_skills_mm(qp_text: str,
                          ans_text: str,
                          qp_images_dataurls: List[str],
                          ans_images_dataurls: List[str]) -> Dict:
     """
-    Multimodal grading:
-      - Sends ORIGINAL question-paper images + answer-sheet images to GPT-4o
-      - Also provides OCR text (if available) to help with small text
-      - Asks the model to align answers to questions, including diagram interpretation
-    Returns the SAME JSON schema as grade_with_skills so frontend/charts keep working.
+    Multimodal grading using raw images + optional text.
     """
     system = (
         "You are a strict school examiner and analyst.\n"
@@ -287,8 +316,6 @@ def grade_with_skills_mm(qp_text: str,
         "Return ONLY valid JSON with the exact keys requested. ≤3 skills per item; skills must be supported by the question/answer evidence."
     )
 
-    # Build multimodal content: first a short instruction, then all QP images, then all ANS images,
-    # then the OCR text (if provided) to augment.
     content = [
         {"type": "text", "text": (
             "GRADE THIS PAPER USING IMAGES (primary) + TEXT (secondary). "
@@ -298,21 +325,16 @@ def grade_with_skills_mm(qp_text: str,
         )}
     ]
 
-    # Attach question-paper images
     for url in qp_images_dataurls:
         content.append({"type": "image_url", "image_url": {"url": url}})
-
-    # Attach answer-sheet images
     for url in ans_images_dataurls:
         content.append({"type": "image_url", "image_url": {"url": url}})
 
-    # Add OCR text (if available)
     if qp_text.strip():
         content.append({"type": "text", "text": "QUESTION PAPER (OCR/text, may be imperfect):\n" + qp_text})
     if ans_text.strip():
         content.append({"type": "text", "text": "STUDENT ANSWERS (OCR/text, may be imperfect):\n" + ans_text})
 
-    # Final JSON spec
     content.append({
         "type": "text",
         "text": """
@@ -322,12 +344,12 @@ Return ONLY JSON with keys EXACTLY:
   "items": [
     {
       "id":"Q1",
-      "question_excerpt":"<=25 words identifying the requirement (include visual cue if any, e.g., 'bar chart on growth 2018-2022')",
-      "answer_excerpt":"<=35 words paraphrasing the student's answer (may reference what their diagram shows)",
+      "question_excerpt":"<=25 words identifying the requirement (mention any visual cue)",
+      "answer_excerpt":"<=35 words paraphrasing the student's answer",
       "max": int,
       "awarded": float,
       "skills": ["skill1","skill2?"],
-      "reason":"<=15 words citing concrete evidence (e.g., 'mismeasured axis labels')"
+      "reason":"<=15 words citing concrete evidence"
     }
   ],
   "total": int,
@@ -338,34 +360,21 @@ Return ONLY JSON with keys EXACTLY:
   "expected_avg_handwriting": float,
   "tips_next_time": ["tip1","tip2","tip3","tip4"]
 }
-
-Rules:
-- Use diagram/graph/table evidence directly from the images when present.
-- If the student's drawing is incorrect (e.g., wrong axis scale, missing legend), penalize and explain briefly in 'reason'.
-- Award fairly; at most one decimal place.
-- Do not invent skills; only those supported by the actual question/answer.
 """
     })
 
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": content}],
-        temperature=0.2,
-        max_tokens=2000
-    )
-    text = resp.choices[0].message.content.strip()
-    if text.startswith("```"):
-        parts = text.split("```")
-        if len(parts) >= 2:
-            text = parts[1]
-            if text.strip().lower().startswith("json"):
-                i = text.find("{")
-                if i != -1:
-                    text = text[i:]
-    data = json.loads(text)
+    def _call():
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": content}],
+            temperature=0.2,
+            max_tokens=1400,
+        )
+        return _coerce_json(resp.choices[0].message.content)
 
-    # Normalize totals (same as your text-only grader)
+    data = _retry(_call)
+
     total = int(round(sum(float(i.get("max",0) or 0) for i in data.get("items", []))))
     score = float(sum(float(i.get("awarded",0) or 0) for i in data.get("items", [])))
     data["total"] = data.get("total", total) or total
@@ -413,7 +422,7 @@ def chart_skill_mix_pie(pool: Dict, subject: str, out_dir: str):
     if df.empty or df["max"].sum() <= 0: return
     vals, labels = df["max"].values, df["skill"].values
     colors = color_cycle(len(labels))
-    fig = plt.figure(figsize=(8.25,6.25))  # +6 px feel
+    fig = plt.figure(figsize=(8.25,6.25))
     plt.pie(vals, labels=labels, autopct="%1.0f%%",
             startangle=140, pctdistance=0.75, colors=colors)
     centre = plt.Circle((0,0),0.50,fc="#0f111a")
@@ -424,7 +433,6 @@ def chart_skill_mix_pie(pool: Dict, subject: str, out_dir: str):
     plt.close(fig)
 
 def chart_skill_mastery(pool: Dict, out_dir: str):
-
     df = pd.DataFrame([{"skill":k, **v} for k,v in pool.items()])
     if df.empty: return
     df["mastery"] = np.where(df["max"]>0, df["awarded"]/df["max"], 0.0)
@@ -471,6 +479,7 @@ def chart_marks_lost_by_question(items: List[Dict], out_dir: str):
     plt.tight_layout()
     fig.savefig(os.path.join(out_dir, "4_marks_lost_by_question.png"), dpi=150)
     plt.close(fig)
+
 def chart_radar(pool: Dict, out_dir: str):
     df = pd.DataFrame([{"skill":k, **v} for k,v in pool.items()])
     if df.empty: return
@@ -494,32 +503,37 @@ def chart_radar(pool: Dict, out_dir: str):
     fig.savefig(os.path.join(out_dir, "5_skill_radar.png"), dpi=150)
     plt.close(fig)
 
+
 # =========================
-# OVERVIEW (LLM) → returns text and writes overview.txt
+# OVERVIEW (LLM) → returns text and writes overview.txt (retry + tighter tokens)
 # =========================
 def write_overview_with_llm(result: Dict) -> str:
     prompt = (
-        "Create a comprehensive, practical overview for the student based ONLY on this JSON. "
-        "Do not invent skills or generic advice. Reference actual question IDs and skills present. "
+        "Create an exam-ready overview for the student based ONLY on this JSON.\n"
+        "Reference actual question IDs and skills present.\n"
         "Include exactly:\n"
         "1) 3–5 Key takeaways tied to the data.\n"
         "2) Top 3 costly mistakes (cite question IDs and why).\n"
-        "3) What to do better next time (bullet list, concrete, paper-specific).\n"
-        "4) 1–2 short worked examples/templates derived from actual mistakes.\n"
-        "No study schedule. Keep it exam-ready.\n\n"
+        "3) What to do better next time (bullet list, paper-specific).\n"
+        "4) 1 worked example/template derived from actual mistakes.\n\n"
         f"JSON:\n{json.dumps(result, ensure_ascii=False)}"
     )
-    r = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role":"user","content":prompt}],
-        temperature=0.3,
-        max_tokens=900
-    )
-    text = r.choices[0].message.content.strip()
+
+    def _call():
+        r = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.3,
+            max_tokens=700,  # tighter to control runtime
+        )
+        return r.choices[0].message.content.strip()
+
+    text = _retry(_call)
     path = os.path.join(OUT_DIR, "overview.txt")
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return text
+
 
 # =========================
 # PIPELINE FOR ONE RUN
@@ -598,6 +612,7 @@ def run_once(qp_text: str, ans_text: str) -> Dict:
             ]
         }
     }
+
 def run_once_mm(qp_text: str,
                 ans_text: str,
                 qp_dataurls: List[str],
@@ -616,7 +631,7 @@ def run_once_mm(qp_text: str,
     with open(OUT_JSON, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
-    # Per-run directory (you added this earlier in the caching fix)
+    # Per-run directory
     run_dir = _new_run_dir()
 
     # Log attempt
@@ -674,6 +689,7 @@ def run_once_mm(qp_text: str,
         }
     }
 
+
 # =========================
 # FLASK APP
 # =========================
@@ -685,12 +701,15 @@ app.permanent_session_lifetime = dt.timedelta(days=60)            # 'remember me
 @app.route("/auth")
 def auth_page():
     return render_template("auth.html")
+
 @app.route('/qpjen')
 def qpjen():
     return render_template('qpjen.html')
 
 
-
+# =========================
+# ROUTES: AUTH
+# =========================
 @app.route("/api/register", methods=["POST"])
 def api_register():
     data = request.get_json(force=True)
@@ -738,17 +757,21 @@ def api_me():
         return jsonify({"logged_in": False})
     return jsonify({"logged_in": True, "email": session.get("email")})
 
+
+# =========================
+# ROUTES: UI + STATIC
+# =========================
 @app.route("/")
 def index():
-    # Frontend HTML should be in templates/index.html
     return render_template("index.html")
+
 def _raw_path(url: str) -> str:
     return (url or "").split("?", 1)[0]
 
 
-from PyPDF2 import PdfReader
-from docx import Document
-
+# =========================
+# ROUTES: GRADING
+# =========================
 @app.route("/api/grade", methods=["POST"])
 def api_grade():
     # ---- Auth guard ----
@@ -770,6 +793,15 @@ def api_grade():
     # Collect all question paper files
     qp_files = request.files.getlist("qp_files[]") or request.files.getlist("qp_imgs[]") or []
     ans_files = request.files.getlist("ans_files[]") or request.files.getlist("ans_imgs[]") or []
+
+    # OPTIONAL: throttle image count to avoid OOM/latency
+    MAX_IMGS = 10
+    def _count_imgs(fs):
+        return len([f for f in fs if f.filename.lower().endswith((".png",".jpg",".jpeg",".bmp",".tiff",".webp"))])
+    if _count_imgs(qp_files) > MAX_IMGS:
+        return jsonify({"error": f"Too many QP images; max {MAX_IMGS}."}), 400
+    if _count_imgs(ans_files) > MAX_IMGS:
+        return jsonify({"error": f"Too many Answer images; max {MAX_IMGS}."}), 400
 
     def extract_text_and_dataurls(file_list, label="QP"):
         texts, dataurls = [], []
@@ -794,12 +826,13 @@ def api_grade():
                     doc_text = "\n".join(p.text for p in doc.paragraphs)
                     texts.append(doc_text)
 
-                # --- IMAGE FILE (jpeg/png/webp etc.) ---
+                # --- IMAGE FILE ---
                 elif filename.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")):
-                    dataurls.append(to_data_url(raw, mime="image/png"))
-                    # optional OCR (for small handwriting/labels)
+                    processed = preprocess_image_bytes(raw)  # resize + enhance
+                    dataurls.append(to_data_url(processed, mime="image/png"))
+                    # optional OCR (fast)
                     try:
-                        texts.append(ocr_gpt4o_from_bytes(preprocess_image_bytes(raw)))
+                        texts.append(ocr_gpt4o_from_bytes(processed))
                     except Exception as e:
                         print(f"OCR error ({label}):", e)
 
@@ -836,15 +869,12 @@ def api_grade():
             out = run_once(qp_text, ans_text)
 
         # ---- Persist the attempt to SQLite ----
-        # subject
         subject = (out.get("result", {}).get("meta") or {}).get("subject") or "Unknown"
 
         # run_dir: try to derive from stored file paths
         run_dir = ""
         try:
-            # Prefer grading_json path if present
             gj = out["files"]["grading_json"]
-            # supports both '/static_file/<dir>/grading.json' and absolute variants
             base = gj.split("/static_file/", 1)[-1]
             run_dir = os.path.dirname(base).replace("\\", "/")
         except Exception:
@@ -876,6 +906,9 @@ def api_grade():
         return jsonify({"error": str(e)}), 500
 
 
+# =========================
+# STATIC FILES
+# =========================
 @app.route("/static_file/<path:fname>")
 def static_file(fname):
     base = os.getcwd()
@@ -886,9 +919,13 @@ def static_file(fname):
     return resp
 
 
+# =========================
+# HEALTH + HISTORY
+# =========================
 @app.route("/health")
 def health():
     return "ok"
+
 @app.route("/api/history")
 def api_history():
     if not current_user_id(): return jsonify({"error":"Unauthorized"}), 401
@@ -910,7 +947,6 @@ def api_attempt(aid):
     # try to load stored grading JSON (safe if file exists)
     try:
         p = a["grading_json"]
-        # remove /static_file/ prefix and any ?v= cachebuster
         jpath = p.split("/static_file/", 1)[-1].split("?", 1)[0]
         result = json.load(open(jpath, "r", encoding="utf-8"))
     except Exception:
@@ -934,9 +970,10 @@ def api_attempt(aid):
 
 
 # =========================
-# MAINYour account doesn't support custom domain names, so your PythonAnywhere web app will live at RicKanjilal.pythonanywhere.com.
+# MAIN
 # =========================
 if __name__ == "__main__":
+    # For local dev; Render will run via gunicorn
     matplotlib.use("Agg")
+    # You can also set an env var for Flask’s built-in timeout behavior if fronted by a proxy.
     app.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False, threaded=False)
-
