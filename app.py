@@ -107,12 +107,19 @@ def save_attempt_to_db(user_id, subject, result, run_dir, files):
 # OPENAI CLIENT
 # =========================
 from openai import OpenAI
+import os
 
 def _get_key():
-    # 🔒 Hardcoded API credentials (no env, no config files)
+    # 🔒 Securely fetch from environment variables (Render / local .env)
+    api_key = os.getenv("OPENAI_API_KEY")
+    project_id = os.getenv("OPENAI_PROJECT_ID")
+
+    if not api_key or not project_id:
+        raise RuntimeError("Missing OPENAI_API_KEY or OPENAI_PROJECT_ID in environment variables.")
+
     return {
-        "api_key": "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",
-        "project": "proj_AbtA9TzevkC7kcF1RHoasD2w"
+        "api_key": api_key,
+        "project": project_id
     }
 
 _creds = _get_key()
